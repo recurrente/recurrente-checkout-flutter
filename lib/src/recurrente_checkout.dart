@@ -1,26 +1,30 @@
 import 'dart:async';
-import 'dart:convert';
-
 import 'package:flutter/material.dart';
 import 'package:webview_flutter/webview_flutter.dart';
-
+import 'package:webview_flutter_android/webview_flutter_android.dart';
+import 'checkout_protocol.dart';
 import 'recurrente_checkout_message.dart';
 
-/// Callback for checkout events emitted by the Recurrente checkout page.
-typedef RecurrenteCheckoutCallback = void Function(
-  RecurrenteCheckoutMessage message,
-);
+/// Receives a validated checkout event; confirm payment status on your backend.
+typedef RecurrenteCheckoutCallback =
+    void Function(RecurrenteCheckoutMessage message);
 
-/// Embeds a Recurrente checkout URL in a WebView.
-///
-/// This widget intentionally mirrors the JavaScript package: it only appends
-/// `embed=true`, renders the checkout URL, and forwards checkout events to
-/// Dart callbacks.
+/// Attach to one checkout widget and call cancel when the user closes it.
+class RecurrenteCheckoutController {
+  VoidCallback? _cancel;
+
+  /// Emits UI cancellation once; the host must then remove the checkout widget.
+  void cancel() => _cancel?.call();
+}
+
+/// Hosted Recurrente checkout, with issuer authentication handled by checkout.
 class RecurrenteCheckout extends StatefulWidget {
-  /// Creates a Recurrente checkout WebView.
+  /// Creates a hosted checkout. Keep its URL stable while payment is in progress.
   const RecurrenteCheckout({
     super.key,
     required this.url,
+    this.controller,
+    this.onCancel,
     this.onSuccess,
     this.onFailure,
     this.onPaymentInProgress,
@@ -28,202 +32,212 @@ class RecurrenteCheckout extends StatefulWidget {
     this.onPageStarted,
     this.onPageFinished,
     this.onWebResourceError,
-    this.allowedOrigin = defaultAllowedOrigin,
-    this.development = false,
+    this.onError,
+    this.onExternalNavigation,
+    this.onReturn,
+    this.returnUrls = const [],
+    this.onFileSelector,
     this.backgroundColor = Colors.transparent,
   });
 
-  /// Recurrente checkout or product URL.
+  /// HTTPS checkout URL supplied by your backend.
   final Uri url;
 
-  /// Called when checkout emits `recurrente-plugin:payment-success`.
+  /// Optional controller for your close/back action.
+  final RecurrenteCheckoutController? controller;
+
+  /// UI cancellation only, not cancellation of a submitted charge.
+  final VoidCallback? onCancel;
+
+  /// Checkout reports success, at most once for this session.
   final RecurrenteCheckoutCallback? onSuccess;
 
-  /// Called when checkout emits `recurrente-plugin:payment-failed`.
+  /// Retryable checkout failure; leave the checkout mounted.
   final RecurrenteCheckoutCallback? onFailure;
 
-  /// Called when checkout emits `recurrente-plugin:payment-in-progress`.
+  /// Transfer submitted for processing; this is not a paid status.
   final RecurrenteCheckoutCallback? onPaymentInProgress;
 
-  /// Called after the underlying WebView controller is created.
+  /// Called after bridge configuration and before loading the checkout.
   final ValueChanged<WebViewController>? onWebViewCreated;
 
-  /// Called when WebView navigation starts.
+  /// Underlying WebView navigation started.
   final ValueChanged<String>? onPageStarted;
 
-  /// Called when WebView navigation finishes.
+  /// Underlying WebView navigation finished; not a payment signal.
   final ValueChanged<String>? onPageFinished;
 
-  /// Called when the WebView reports a resource error.
+  /// Underlying WebView resource error, separate from a payment decline.
   final ValueChanged<WebResourceError>? onWebResourceError;
 
-  /// Expected checkout event origin.
-  final String allowedOrigin;
+  /// Configuration or missing picker error, separate from a payment decline.
+  final ValueChanged<String>? onError;
 
-  /// Allows checkout events from any origin, useful for local development.
-  final bool development;
+  /// Host decides whether to launch an external link; never infer payment success.
+  final ValueChanged<Uri>? onExternalNavigation;
 
-  /// WebView background color.
+  /// Matched return route; query your backend before treating it as paid.
+  final ValueChanged<Uri>? onReturn;
+
+  /// Exact scheme, host, path and required query parameters to intercept.
+  final List<Uri> returnUrls;
+
+  /// Android receipt upload. Return selected content/file URIs, or [] on cancel.
+  final Future<List<String>> Function(FileSelectorParams)? onFileSelector;
+
+  /// Background while the hosted content is loading.
   final Color backgroundColor;
 
-  /// Default production origin for checkout events.
-  static const defaultAllowedOrigin = 'https://app.recurrente.com';
+  /// Only this hosted origin can send accepted checkout events.
+  static const defaultAllowedOrigin = CheckoutProtocol.origin;
 
-  /// Returns a checkout URI with `embed=true` present.
-  static Uri embeddedUri(Uri url) {
-    if (url.queryParameters['embed'] == 'true') {
-      return url;
-    }
-
-    return url.replace(
-      queryParameters: <String, String>{
-        ...url.queryParameters,
-        'embed': 'true',
-      },
-    );
-  }
+  /// Validates the trusted HTTPS URL and adds one embed=true parameter.
+  static Uri embeddedUri(Uri url) => CheckoutProtocol.embeddedUri(url);
 
   @override
   State<RecurrenteCheckout> createState() => _RecurrenteCheckoutState();
 }
 
 class _RecurrenteCheckoutState extends State<RecurrenteCheckout> {
-  static const _channelName = 'RecurrenteCheckoutBridge';
-
   late final WebViewController _controller;
+  late final Future<void> _configuration;
+  String _session = CheckoutProtocol.session();
+  bool _closed = false;
+  int _revision = 0;
 
   @override
   void initState() {
     super.initState();
+    widget.controller?._cancel = _cancelSession;
+    _controller = WebViewController();
+    _configuration = _configure();
+    unawaited(_load());
+  }
 
-    _controller = WebViewController()
-      ..setJavaScriptMode(JavaScriptMode.unrestricted)
-      ..setBackgroundColor(widget.backgroundColor)
-      ..addJavaScriptChannel(
-        _channelName,
-        onMessageReceived: _handleJavaScriptMessage,
-      )
-      ..setNavigationDelegate(
-        NavigationDelegate(
-          onPageStarted: (url) {
-            widget.onPageStarted?.call(url);
-          },
-          onPageFinished: (url) {
-            _installMessageBridge();
-            widget.onPageFinished?.call(url);
-          },
-          onWebResourceError: (error) {
-            widget.onWebResourceError?.call(error);
-          },
-        ),
-      )
-      ..loadRequest(RecurrenteCheckout.embeddedUri(widget.url));
+  Future<void> _configure() async {
+    final backgroundColor = widget.backgroundColor;
+    await _controller.setJavaScriptMode(JavaScriptMode.unrestricted);
+    if (!mounted) return;
+    await _controller.setBackgroundColor(backgroundColor);
+    if (!mounted) return;
+    await _controller.addJavaScriptChannel(
+      'RecurrenteCheckoutBridge',
+      onMessageReceived: (raw) {
+        if (!mounted || _closed) return;
+        final message = CheckoutProtocol.decode(raw.message, _session);
+        if (message == null) return;
+        switch (message.type) {
+          case RecurrenteCheckoutMessage.paymentSuccessType:
+            _closed = true;
+            widget.onSuccess?.call(message);
+          case RecurrenteCheckoutMessage.paymentFailedType:
+            widget.onFailure?.call(message);
+          case RecurrenteCheckoutMessage.paymentInProgressType:
+            widget.onPaymentInProgress?.call(message);
+        }
+      },
+    );
+    if (!mounted) return;
+    await _controller.setNavigationDelegate(
+      NavigationDelegate(
+        onNavigationRequest: (request) {
+          if (!mounted || _closed) return NavigationDecision.prevent;
+          final uri = Uri.tryParse(request.url);
+          if (uri == null) return NavigationDecision.prevent;
+          if (CheckoutProtocol.matchesReturn(uri, widget.returnUrls)) {
+            widget.onReturn?.call(uri);
+            return NavigationDecision.prevent;
+          }
+          if (request.url == 'about:blank' ||
+              request.url == '${CheckoutProtocol.shellOrigin}/') {
+            return NavigationDecision.navigate;
+          }
+          if (!request.isMainFrame && uri.scheme == 'https') {
+            return NavigationDecision.navigate;
+          }
+          widget.onExternalNavigation?.call(uri);
+          return NavigationDecision.prevent;
+        },
+        onPageStarted: (url) {
+          if (mounted) widget.onPageStarted?.call(url);
+        },
+        onPageFinished: (url) {
+          if (mounted) widget.onPageFinished?.call(url);
+        },
+        onWebResourceError: (error) {
+          if (mounted) widget.onWebResourceError?.call(error);
+        },
+      ),
+    );
+    if (!mounted) return;
+    if (_controller.platform is AndroidWebViewController) {
+      final android = _controller.platform as AndroidWebViewController;
+      await android.setOnShowFileSelector((params) async {
+        if (!mounted) return [];
+        final callback = widget.onFileSelector;
+        if (callback == null) {
+          widget.onError?.call(
+            'Configure onFileSelector to upload bank-transfer receipts',
+          );
+          return [];
+        }
+        return callback(params);
+      });
+      final cookies = WebViewCookieManager().platform;
+      if (cookies is AndroidWebViewCookieManager) {
+        await cookies.setAcceptThirdPartyCookies(android, true);
+      }
+    }
+    if (mounted) widget.onWebViewCreated?.call(_controller);
+  }
 
-    widget.onWebViewCreated?.call(_controller);
+  Future<void> _load() async {
+    final revision = ++_revision;
+    _session = CheckoutProtocol.session();
+    _closed = false;
+    try {
+      final html = CheckoutProtocol.html(widget.url, _session);
+      await _configuration;
+      if (!mounted || _closed || revision != _revision) return;
+      await _controller.loadHtmlString(
+        html,
+        baseUrl: '${CheckoutProtocol.shellOrigin}/',
+      );
+    } catch (error) {
+      if (mounted && revision == _revision) {
+        widget.onError?.call(error.toString());
+      }
+    }
+  }
+
+  void _cancelSession() {
+    if (_closed) return;
+    _closed = true;
+    widget.onCancel?.call();
   }
 
   @override
   void didUpdateWidget(covariant RecurrenteCheckout oldWidget) {
     super.didUpdateWidget(oldWidget);
-
+    if (oldWidget.controller != widget.controller) {
+      oldWidget.controller?._cancel = null;
+      widget.controller?._cancel = _cancelSession;
+    }
+    if (oldWidget.url != widget.url) unawaited(_load());
     if (oldWidget.backgroundColor != widget.backgroundColor) {
       unawaited(_controller.setBackgroundColor(widget.backgroundColor));
-    }
-
-    if (oldWidget.url != widget.url) {
-      unawaited(
-        _controller.loadRequest(RecurrenteCheckout.embeddedUri(widget.url)),
-      );
     }
   }
 
   @override
-  Widget build(BuildContext context) {
-    return WebViewWidget(controller: _controller);
+  void dispose() {
+    _closed = true;
+    widget.controller?._cancel = null;
+    ++_revision;
+    unawaited(_controller.removeJavaScriptChannel('RecurrenteCheckoutBridge'));
+    super.dispose();
   }
 
-  void _installMessageBridge() {
-    unawaited(
-      _controller.runJavaScript('''
-        (function () {
-          if (window.__recurrenteCheckoutBridgeInstalled) return;
-          window.__recurrenteCheckoutBridgeInstalled = true;
-
-          window.addEventListener('message', function (event) {
-            if (!event.data || !event.data.type) return;
-            if (String(event.data.type).indexOf('recurrente-plugin:') !== 0) {
-              return;
-            }
-
-            window.$_channelName.postMessage(JSON.stringify({
-              origin: event.origin,
-              data: event.data
-            }));
-          });
-        })();
-      ''').onError<Object>((_, _) {}),
-    );
-  }
-
-  void _handleJavaScriptMessage(JavaScriptMessage message) {
-    final decoded = _decodeMessage(message.message);
-    if (decoded == null) {
-      return;
-    }
-
-    final origin = decoded.origin;
-    if (!widget.development && origin != widget.allowedOrigin) {
-      return;
-    }
-
-    final checkoutMessage = RecurrenteCheckoutMessage(
-      origin: origin,
-      payload: decoded.payload,
-    );
-
-    switch (checkoutMessage.type) {
-      case RecurrenteCheckoutMessage.paymentSuccessType:
-        widget.onSuccess?.call(checkoutMessage);
-      case RecurrenteCheckoutMessage.paymentFailedType:
-        widget.onFailure?.call(checkoutMessage);
-      case RecurrenteCheckoutMessage.paymentInProgressType:
-        widget.onPaymentInProgress?.call(checkoutMessage);
-    }
-  }
-
-  _DecodedCheckoutMessage? _decodeMessage(String rawMessage) {
-    final Object? decoded;
-
-    try {
-      decoded = jsonDecode(rawMessage);
-    } on FormatException {
-      return null;
-    }
-
-    if (decoded is! Map<String, dynamic>) {
-      return null;
-    }
-
-    final origin = decoded['origin'];
-    final data = decoded['data'];
-
-    if (origin is! String || data is! Map) {
-      return null;
-    }
-
-    return _DecodedCheckoutMessage(
-      origin: origin,
-      payload: Map<String, dynamic>.from(data),
-    );
-  }
-}
-
-class _DecodedCheckoutMessage {
-  const _DecodedCheckoutMessage({
-    required this.origin,
-    required this.payload,
-  });
-
-  final String origin;
-  final Map<String, dynamic> payload;
+  @override
+  Widget build(BuildContext context) => WebViewWidget(controller: _controller);
 }

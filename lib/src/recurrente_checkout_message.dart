@@ -40,6 +40,5 @@ class RecurrenteCheckoutMessage {
   static const paymentFailedType = 'recurrente-plugin:payment-failed';
 
   /// Browser message type emitted when a bank-transfer payment is processing.
-  static const paymentInProgressType =
-      'recurrente-plugin:payment-in-progress';
+  static const paymentInProgressType = 'recurrente-plugin:payment-in-progress';
 }
