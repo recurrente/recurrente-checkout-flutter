@@ -1,6 +1,6 @@
 name: recurrente_checkout_flutter
 description: Thin Flutter WebView wrapper for embedding Recurrente Checkout in mobile apps.
-version: 0.0.1
+version: 0.1.0-rc.0
 homepage: https://recurrente.com
 repository: https://github.com/Recurrente/recurrente-checkout-flutter
 issue_tracker: https://github.com/Recurrente/recurrente-checkout-flutter/issues
@@ -18,6 +18,7 @@ dependencies:
   flutter:
     sdk: flutter
   webview_flutter: ^4.14.0
+  webview_flutter_android: ^4.13.0
 
 dev_dependencies:
   flutter_test:
